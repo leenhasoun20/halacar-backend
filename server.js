@@ -1,5 +1,405 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import admin from "firebase-admin";
+
+dotenv.config();
+
+let db;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+
+  db = admin.firestore();
+  console.log("✅ Firebase Admin connected");
+} catch (e) {
+  console.error("❌ Firebase Admin init failed:", e.message);
+}
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
+
+app.get("/", (req, res) => res.send("Hala Car AI Backend is running ✅"));
+
+async function sendExpoPush(tokens, title, body, data = {}) {
+  if (!tokens || tokens.length === 0) return { sent: 0 };
+
+  const validTokens = tokens.filter((t) => t && t.startsWith("ExponentPushToken"));
+
+  const messages = validTokens.map((token) => ({
+    to: token,
+    sound: "default",
+    title,
+    body,
+    data,
+    android: { channelId: "default" },
+    priority: "high",
+  }));
+
+  const chunks = [];
+  for (let i = 0; i < messages.length; i += 100) {
+    chunks.push(messages.slice(i, i + 100));
+  }
+
+  let totalSent = 0;
+
+  for (const chunk of chunks) {
+    try {
+      const res = await fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(chunk),
+      });
+
+      const result = await res.json();
+      totalSent += chunk.length;
+      console.log(`Push sent: ${chunk.length}`, result?.data?.slice(0, 2));
+    } catch (e) {
+      console.error("Push send error:", e.message);
+    }
+  }
+
+  return { sent: totalSent };
+}
+
+async function saveNotification({ userId, title, body, type, screen, screenParams }) {
+  try {
+    if (!db) {
+      console.log("⚠️ Firestore not connected, notification not saved");
+      return;
+    }
+
+    await db.collection("notifications").add({
+      userId: userId || "all",
+      title,
+      body: body || "",
+      type: type || "general",
+      screen: screen || null,
+      screenParams: screenParams || null,
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    console.error("saveNotification error:", e.message);
+  }
+}
+
+app.post("/notify/new-product", async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        error: "Firestore is not connected",
+      });
+    }
+
+    const { productId, productName, category, targetBrands = [] } = req.body;
+
+    if (!productName) {
+      return res.status(400).json({
+        success: false,
+        error: "productName required",
+      });
+    }
+
+    const snapshot = await db.collection("users").where("expoPushToken", "!=", null).get();
+
+    const tokens = [];
+    const userIds = [];
+
+    snapshot.forEach((docSnap) => {
+      const user = docSnap.data();
+
+      if (!user.expoPushToken) return;
+
+      if (targetBrands.length > 0) {
+        const userCar = (user.car || "").toLowerCase();
+        const userCar2 = (user.secondCar || "").toLowerCase();
+
+        const match = targetBrands.some(
+          (b) =>
+            userCar.includes(b.toLowerCase()) ||
+            userCar2.includes(b.toLowerCase())
+        );
+
+        if (!match) return;
+      }
+
+      tokens.push(user.expoPushToken);
+      userIds.push(docSnap.id);
+    });
+
+    const title = `🆕 New ${category || "Product"} Available!`;
+    const body = productName;
+
+    const result = await sendExpoPush(tokens, title, body, {
+      screen: "ProductDetail",
+      productId,
+    });
+
+    await Promise.all(
+      userIds.map((uid) =>
+        saveNotification({
+          userId: uid,
+          title,
+          body,
+          type: "product",
+          screen: "ProductDetail",
+          screenParams: { productId },
+        })
+      )
+    );
+
+    res.json({
+      success: true,
+      ...result,
+      matched: tokens.length,
+    });
+  } catch (e) {
+    console.error("/notify/new-product error:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+app.post("/notify/service-status", async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        error: "Firestore is not connected",
+      });
+    }
+
+    const { requestId, userId, status, serviceTitle } = req.body;
+
+    if (!userId || !status) {
+      return res.status(400).json({
+        success: false,
+        error: "userId and status required",
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    const token = userDoc.data().expoPushToken;
+
+    const statusMessages = {
+      confirmed: {
+        title: "✅ Booking Confirmed!",
+        body: `Your ${serviceTitle || "service"} has been confirmed.`,
+      },
+      accepted: {
+        title: "✅ Request Accepted!",
+        body: `A technician has been assigned to your ${serviceTitle || "service"}.`,
+      },
+      in_progress: {
+        title: "🚗 Technician On The Way!",
+        body: "Your technician is heading to you now.",
+      },
+      done: {
+        title: "✓ Service Completed!",
+        body: `Your ${serviceTitle || "service"} is done. Rate your experience!`,
+      },
+      cancelled: {
+        title: "❌ Booking Cancelled",
+        body: `Your ${serviceTitle || "service"} request was cancelled.`,
+      },
+    };
+
+    const msg = statusMessages[status];
+
+    if (!msg) {
+      return res.json({
+        success: true,
+        sent: 0,
+        reason: "No message for this status",
+      });
+    }
+
+    let result = { sent: 0 };
+
+    if (token) {
+      result = await sendExpoPush([token], msg.title, msg.body, {
+        screen: "OrderTracking",
+        requestId,
+      });
+    }
+
+    await saveNotification({
+      userId,
+      title: msg.title,
+      body: msg.body,
+      type: "service",
+      screen: "OrderTracking",
+      screenParams: { requestId },
+    });
+
+    res.json({
+      success: true,
+      ...result,
+    });
+  } catch (e) {
+    console.error("/notify/service-status error:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+app.post("/notify/ad", async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        error: "Firestore is not connected",
+      });
+    }
+
+    const { adId, adTitle, adDescription } = req.body;
+
+    if (!adTitle) {
+      return res.status(400).json({
+        success: false,
+        error: "adTitle required",
+      });
+    }
+
+    const snapshot = await db.collection("users").where("expoPushToken", "!=", null).get();
+
+    const tokens = [];
+
+    snapshot.forEach((doc) => {
+      const token = doc.data().expoPushToken;
+      if (token) tokens.push(token);
+    });
+
+    const title = `🎉 ${adTitle}`;
+    const body = adDescription || "Check out our latest offer!";
+
+    const result = await sendExpoPush(tokens, title, body, {
+      screen: "AdDetail",
+      adId,
+    });
+
+    await saveNotification({
+      userId: "all",
+      title,
+      body,
+      type: "ad",
+      screen: "AdDetail",
+      screenParams: { adId },
+    });
+
+    res.json({
+      success: true,
+      ...result,
+      total: tokens.length,
+    });
+  } catch (e) {
+    console.error("/notify/ad error:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+app.post("/chat", async (req, res) => {
+  try {
+    const { message, history = [] } = req.body;
+
+    if (!message) {
+      return res.status(400).json({
+        success: false,
+        error: "No message provided",
+      });
+    }
+
+    const messages = [
+      {
+        role: "system",
+        content: `أنت مساعد ذكي لمتجر HalaCar المتخصص في بيع الجنوط والإطارات وإكسسوارات السيارات في فلسطين.
+مهمتك مساعدة العملاء في:
+- اختيار الجنط المناسب لسيارتهم
+- اختيار الإطارات المناسبة
+- الإجابة عن أسئلة الصيانة والتركيب
+- شرح الفرق بين المنتجات والمواصفات التقنية
+قواعد: رد دائماً بالعربية بأسلوب ودي ومختصر. معلومات التواصل: هاتف +970595100676، إيميل halacar-1@hotmail.com`,
+      },
+      ...history.slice(-10).map((m) => ({
+        role: m.role === "bot" ? "assistant" : "user",
+        content: m.content,
+      })),
+      {
+        role: "user",
+        content: message,
+      },
+    ];
+
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        messages,
+        max_tokens: 512,
+        temperature: 0.7,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      return res.status(500).json({
+        success: false,
+        error: data.error.message,
+      });
+    }
+
+    res.json({
+      success: true,
+      reply: data.choices?.[0]?.message?.content || "عذراً، حاول مرة ثانية.",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "Chat failed",
+      details: error.message,
+    });
+  }
+});
+
 async function urlToBuffer(url) {
   const r = await fetch(url);
+
   if (!r.ok) {
     throw new Error(`Failed to download image: ${r.status} ${r.statusText}`);
   }
@@ -23,7 +423,7 @@ async function analyzeWheelImage({ wheelImageUrl, wheelDescription, openaiKey })
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`,
+        Authorization: `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
         model: "gpt-4o",
@@ -34,7 +434,9 @@ async function analyzeWheelImage({ wheelImageUrl, wheelDescription, openaiKey })
             content: [
               {
                 type: "image_url",
-                image_url: { url: wheelImageUrl },
+                image_url: {
+                  url: wheelImageUrl,
+                },
               },
               {
                 type: "text",
@@ -93,11 +495,6 @@ async function generateCameraPreview({
     `The final image must look like a real product preview photo, not a drawing. ` +
     `Car context if useful: ${carModel || "unknown car"}, angle: ${carAngle || "side view"}.`;
 
-  /*
-    المحاولة الأولى:
-    نرسل صورة السيارة + صورة الجنط كمرجع.
-    لو الـ API قبل صورتين، النتيجة تكون أفضل.
-  */
   if (wheelImageUrl) {
     try {
       const wheelBuffer = await urlToBuffer(wheelImageUrl);
@@ -123,7 +520,7 @@ async function generateCameraPreview({
       const editRes = await fetch("https://api.openai.com/v1/images/edits", {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${openaiKey}`,
+          Authorization: `Bearer ${openaiKey}`,
         },
         body: formData,
       });
@@ -152,10 +549,6 @@ async function generateCameraPreview({
     }
   }
 
-  /*
-    fallback:
-    لو إرسال صورتين فشل، نرسل صورة السيارة فقط مع وصف دقيق للجنط.
-  */
   const fallbackFormData = new FormData();
   fallbackFormData.append("model", "gpt-image-1");
   fallbackFormData.append(
@@ -174,7 +567,7 @@ async function generateCameraPreview({
   const fallbackRes = await fetch("https://api.openai.com/v1/images/edits", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${openaiKey}`,
+      Authorization: `Bearer ${openaiKey}`,
     },
     body: fallbackFormData,
   });
@@ -207,10 +600,6 @@ async function generateCarFromSpecsWithWheel({
   carModel,
   carAngle,
 }) {
-  /*
-    هذا الوضع لما المستخدم يختار مواصفات السيارة بدون تصوير.
-    إذا عندنا صورة جنط، نرسلها كمرجع.
-  */
   if (wheelImageUrl) {
     try {
       const wheelBuffer = await urlToBuffer(wheelImageUrl);
@@ -240,7 +629,7 @@ async function generateCarFromSpecsWithWheel({
       const genRes = await fetch("https://api.openai.com/v1/images/edits", {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${openaiKey}`,
+          Authorization: `Bearer ${openaiKey}`,
         },
         body: formData,
       });
@@ -269,9 +658,6 @@ async function generateCarFromSpecsWithWheel({
     }
   }
 
-  /*
-    fallback بدون صورة جنط.
-  */
   const prompt =
     `Ultra-realistic professional automotive showroom photograph. ` +
     `A ${carModel || "modern luxury sedan"} shot from the ${carAngle || "side profile"}, ` +
@@ -285,7 +671,7 @@ async function generateCarFromSpecsWithWheel({
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${openaiKey}`,
+      Authorization: `Bearer ${openaiKey}`,
     },
     body: JSON.stringify({
       model: "dall-e-3",
@@ -383,4 +769,10 @@ app.post("/generate-preview", async (req, res) => {
       details: error.message,
     });
   }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Hala Car Backend running on port ${PORT}`);
 });
