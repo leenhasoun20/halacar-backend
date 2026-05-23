@@ -486,29 +486,37 @@ function extractRunPodImageUrl(data) {
   if (data.image_url) return data.image_url;
   if (data.imageUrl) return data.imageUrl;
   if (data.url) return data.url;
+  if (data.result) return data.result;
 
-  if (Array.isArray(data.output)) {
-    const first = data.output[0];
+  if (data.output) {
+    if (typeof data.output === "string") return data.output;
 
-    if (typeof first === "string") return first;
-    if (first?.image) return first.image;
-    if (first?.image_url) return first.image_url;
-    if (first?.imageUrl) return first.imageUrl;
-    if (first?.url) return first.url;
-  }
+    if (data.output.result) return data.output.result;
+    if (data.output.image) return data.output.image;
+    if (data.output.image_url) return data.output.image_url;
+    if (data.output.imageUrl) return data.output.imageUrl;
+    if (data.output.url) return data.output.url;
 
-  if (data.output?.image) return data.output.image;
-  if (data.output?.image_url) return data.output.image_url;
-  if (data.output?.imageUrl) return data.output.imageUrl;
-  if (data.output?.url) return data.output.url;
+    if (Array.isArray(data.output)) {
+      const first = data.output[0];
 
-  if (data.output?.images && Array.isArray(data.output.images)) {
-    const first = data.output.images[0];
+      if (typeof first === "string") return first;
+      if (first?.result) return first.result;
+      if (first?.image) return first.image;
+      if (first?.image_url) return first.image_url;
+      if (first?.imageUrl) return first.imageUrl;
+      if (first?.url) return first.url;
+    }
 
-    if (typeof first === "string") return first;
-    if (first?.url) return first.url;
-    if (first?.image_url) return first.image_url;
-    if (first?.imageUrl) return first.imageUrl;
+    if (data.output.images && Array.isArray(data.output.images)) {
+      const first = data.output.images[0];
+
+      if (typeof first === "string") return first;
+      if (first?.result) return first.result;
+      if (first?.url) return first.url;
+      if (first?.image_url) return first.image_url;
+      if (first?.imageUrl) return first.imageUrl;
+    }
   }
 
   return null;
@@ -570,44 +578,6 @@ async function pollRunPodJob({ runpodApiKey, jobId, maxAttempts = 60 }) {
   throw new Error("RunPod timeout: image generation took too long");
 }
 
-async function uploadBase64ToRunPodAsset({ runpodApiKey, base64Image }) {
-  const cleanBase64 = normalizeBase64Image(base64Image);
-
-  const response = await fetch("https://api.runpod.ai/v2/upload", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${runpodApiKey}`,
-    },
-    body: JSON.stringify({
-      data: cleanBase64,
-      type: "image/png",
-    }),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error || data?.message || `RunPod upload failed: ${response.status}`
-    );
-  }
-
-  const uploadedUrl =
-    data.url ||
-    data.image ||
-    data.image_url ||
-    data.output?.url ||
-    data.output?.image ||
-    data.output?.image_url;
-
-  if (!uploadedUrl) {
-    throw new Error(`RunPod upload returned no URL: ${JSON.stringify(data).slice(0, 800)}`);
-  }
-
-  return uploadedUrl;
-}
-
 async function runpodFluxKontextEdit({
   runpodApiKey,
   carImageBase64,
@@ -623,7 +593,7 @@ async function runpodFluxKontextEdit({
     throw new Error("carImageBase64 is required for RunPod Flux Kontext");
   }
 
-  let inputImage = carImageBase64.startsWith("data:image")
+  const inputImage = carImageBase64.startsWith("data:image")
     ? carImageBase64
     : `data:image/jpeg;base64,${normalizeBase64Image(carImageBase64)}`;
 
@@ -636,58 +606,38 @@ async function runpodFluxKontextEdit({
     `Do not redraw the full car. Do not change the background. Do not change the tire rubber. ` +
     `Car context: ${carModel || "unknown car"}, angle: ${carAngle || "unknown angle"}.`;
 
-  let data;
-
-  async function submitToRunPod(imageValue) {
-    const response = await fetch(
-      "https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${runpodApiKey}`,
+  const response = await fetch(
+    "https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${runpodApiKey}`,
+      },
+      body: JSON.stringify({
+        input: {
+          prompt,
+          negative_prompt: "",
+          seed: -1,
+          num_inference_steps: 28,
+          guidance: 2,
+          image: inputImage,
+          size: "1024*1024",
+          output_format: "png",
+          enable_safety_checker: true,
         },
-        body: JSON.stringify({
-          input: {
-            prompt,
-            negative_prompt: "",
-            seed: -1,
-            num_inference_steps: 28,
-            guidance: 2,
-            image: imageValue,
-            size: "1024*1024",
-            output_format: "png",
-            enable_safety_checker: true,
-          },
-        }),
-      }
-    );
-
-    const responseData = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        responseData?.error ||
-          responseData?.message ||
-          `RunPod request failed: ${response.status}`
-      );
+      }),
     }
+  );
 
-    return responseData;
-  }
+  const data = await response.json();
 
-  try {
-    data = await submitToRunPod(inputImage);
-  } catch (e) {
-    console.log("⚠️ RunPod base64 submit failed, trying uploaded image URL:", e.message);
-
-    const uploadedUrl = await uploadBase64ToRunPodAsset({
-      runpodApiKey,
-      base64Image: carImageBase64,
-    });
-
-    inputImage = uploadedUrl;
-    data = await submitToRunPod(inputImage);
+  if (!response.ok) {
+    throw new Error(
+      data?.error ||
+        data?.message ||
+        `RunPod request failed: ${response.status}`
+    );
   }
 
   const directImageUrl = extractRunPodImageUrl(data);
