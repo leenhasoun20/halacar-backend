@@ -6,6 +6,7 @@ import admin from "firebase-admin";
 dotenv.config();
 
 let db;
+
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
 
@@ -27,7 +28,9 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-app.get("/", (req, res) => res.send("Hala Car AI Backend is running ✅"));
+app.get("/", (req, res) => {
+  res.send("Hala Car AI Backend is running ✅");
+});
 
 async function sendExpoPush(tokens, title, body, data = {}) {
   if (!tokens || tokens.length === 0) return { sent: 0 };
@@ -416,7 +419,7 @@ function normalizeBase64Image(base64Image) {
 async function analyzeWheelImage({ wheelImageUrl, wheelDescription, openaiKey }) {
   let detailedWheelDesc = wheelDescription || "modern premium alloy wheel rim";
 
-  if (!wheelImageUrl) return detailedWheelDesc;
+  if (!wheelImageUrl || !openaiKey) return detailedWheelDesc;
 
   try {
     const visionRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -474,7 +477,109 @@ Output ONLY the description, max 90 words.`,
   return detailedWheelDesc;
 }
 
-async function generateCameraPreview({
+function extractRunPodImageUrl(data) {
+  if (!data) return null;
+
+  if (typeof data === "string") return data;
+
+  if (data.image) return data.image;
+  if (data.image_url) return data.image_url;
+  if (data.imageUrl) return data.imageUrl;
+  if (data.url) return data.url;
+
+  if (Array.isArray(data.output)) {
+    const first = data.output[0];
+
+    if (typeof first === "string") return first;
+    if (first?.image) return first.image;
+    if (first?.image_url) return first.image_url;
+    if (first?.url) return first.url;
+  }
+
+  if (data.output?.image) return data.output.image;
+  if (data.output?.image_url) return data.output.image_url;
+  if (data.output?.url) return data.output.url;
+
+  if (data.output?.images && Array.isArray(data.output.images)) {
+    const first = data.output.images[0];
+
+    if (typeof first === "string") return first;
+    if (first?.url) return first.url;
+    if (first?.image_url) return first.image_url;
+  }
+
+  return null;
+}
+
+async function runpodFluxKontextEdit({
+  runpodApiKey,
+  carImageBase64,
+  detailedWheelDesc,
+  carModel,
+  carAngle,
+}) {
+  if (!runpodApiKey) {
+    throw new Error("RUNPOD_API_KEY is missing");
+  }
+
+  if (!carImageBase64) {
+    throw new Error("carImageBase64 is required for RunPod Flux Kontext");
+  }
+
+  const inputImage = carImageBase64.startsWith("data:image")
+    ? carImageBase64
+    : `data:image/jpeg;base64,${normalizeBase64Image(carImageBase64)}`;
+
+  const prompt =
+    `Replace the visible wheels on this car with ${detailedWheelDesc}. ` +
+    `Keep the car body, angle, lighting, background, windows, paint color, reflections, tires, and camera perspective the same. ` +
+    `Only change the metal alloy rim/spoke/center-cap area. ` +
+    `Make the wheel fitment realistic and accurate to the car perspective, with correct size, alignment, depth, and shadow. ` +
+    `The wheels must look naturally mounted on the car, photorealistic, sharp, and high quality. ` +
+    `Do not redraw the full car. Do not change the background. Do not change the tire rubber. ` +
+    `Car context: ${carModel || "unknown car"}, angle: ${carAngle || "unknown angle"}.`;
+
+  const response = await fetch("https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${runpodApiKey}`,
+    },
+    body: JSON.stringify({
+      input: {
+        prompt,
+        negative_prompt: "",
+        seed: -1,
+        num_inference_steps: 28,
+        guidance: 2,
+        image: inputImage,
+        size: "1024*1024",
+        output_format: "png",
+        enable_safety_checker: true,
+      },
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `RunPod request failed: ${response.status}`);
+  }
+
+  const imageUrl = extractRunPodImageUrl(data);
+
+  if (!imageUrl) {
+    throw new Error(`RunPod returned no image URL: ${JSON.stringify(data).slice(0, 500)}`);
+  }
+
+  return {
+    imageUrl,
+    providerMode: "runpod_flux_kontext_public_endpoint",
+    raw: data,
+  };
+}
+
+async function openAICameraEditFallback({
   openaiKey,
   carImageBase64,
   wheelImageUrl,
@@ -482,6 +587,10 @@ async function generateCameraPreview({
   carModel,
   carAngle,
 }) {
+  if (!openaiKey) {
+    throw new Error("OPENAI_API_KEY is missing and RunPod failed");
+  }
+
   const base64Data = normalizeBase64Image(carImageBase64);
   const carBuffer = Buffer.from(base64Data, "base64");
 
@@ -530,22 +639,20 @@ async function generateCameraPreview({
       if (editData.data?.[0]?.url) {
         return {
           imageUrl: editData.data[0].url,
-          usedWheelReference: true,
-          providerMode: "camera_edit_with_wheel_reference",
+          providerMode: "openai_camera_edit_with_wheel_reference",
         };
       }
 
       if (editData.data?.[0]?.b64_json) {
         return {
           imageUrl: `data:image/png;base64,${editData.data[0].b64_json}`,
-          usedWheelReference: true,
-          providerMode: "camera_edit_with_wheel_reference",
+          providerMode: "openai_camera_edit_with_wheel_reference",
         };
       }
 
-      console.log("⚠️ Two-image edit failed:", editData.error?.message || editData);
+      console.log("⚠️ OpenAI two-image edit failed:", editData.error?.message || editData);
     } catch (e) {
-      console.log("⚠️ Two-image camera edit failed:", e.message);
+      console.log("⚠️ OpenAI two-image camera edit exception:", e.message);
     }
   }
 
@@ -577,29 +684,31 @@ async function generateCameraPreview({
   if (fallbackData.data?.[0]?.url) {
     return {
       imageUrl: fallbackData.data[0].url,
-      usedWheelReference: false,
-      providerMode: "camera_edit_description_only",
+      providerMode: "openai_camera_edit_description_only",
     };
   }
 
   if (fallbackData.data?.[0]?.b64_json) {
     return {
       imageUrl: `data:image/png;base64,${fallbackData.data[0].b64_json}`,
-      usedWheelReference: false,
-      providerMode: "camera_edit_description_only",
+      providerMode: "openai_camera_edit_description_only",
     };
   }
 
-  throw new Error(fallbackData.error?.message || "Camera edit failed");
+  throw new Error(fallbackData.error?.message || "OpenAI camera edit failed");
 }
 
-async function generateCarFromSpecsWithWheel({
+async function openAIGenerateCarFromSpecsFallback({
   openaiKey,
   wheelImageUrl,
   detailedWheelDesc,
   carModel,
   carAngle,
 }) {
+  if (!openaiKey) {
+    throw new Error("OPENAI_API_KEY is missing for AI Generate fallback");
+  }
+
   if (wheelImageUrl) {
     try {
       const wheelBuffer = await urlToBuffer(wheelImageUrl);
@@ -639,22 +748,20 @@ async function generateCarFromSpecsWithWheel({
       if (genData.data?.[0]?.url) {
         return {
           imageUrl: genData.data[0].url,
-          usedWheelReference: true,
-          providerMode: "spec_generation_with_wheel_reference",
+          providerMode: "openai_spec_generation_with_wheel_reference",
         };
       }
 
       if (genData.data?.[0]?.b64_json) {
         return {
           imageUrl: `data:image/png;base64,${genData.data[0].b64_json}`,
-          usedWheelReference: true,
-          providerMode: "spec_generation_with_wheel_reference",
+          providerMode: "openai_spec_generation_with_wheel_reference",
         };
       }
 
-      console.log("⚠️ Wheel reference generation failed:", genData.error?.message || genData);
+      console.log("⚠️ OpenAI wheel reference generation failed:", genData.error?.message || genData);
     } catch (e) {
-      console.log("⚠️ Wheel reference generation exception:", e.message);
+      console.log("⚠️ OpenAI wheel reference generation exception:", e.message);
     }
   }
 
@@ -688,12 +795,11 @@ async function generateCarFromSpecsWithWheel({
   if (genData.data?.[0]?.url) {
     return {
       imageUrl: genData.data[0].url,
-      usedWheelReference: false,
-      providerMode: "spec_generation_description_only",
+      providerMode: "openai_spec_generation_description_only",
     };
   }
 
-  throw new Error(genData.error?.message || "dall-e-3 generation failed");
+  throw new Error(genData.error?.message || "OpenAI DALL-E generation failed");
 }
 
 app.post("/generate-preview", async (req, res) => {
@@ -708,16 +814,10 @@ app.post("/generate-preview", async (req, res) => {
     } = req.body;
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-
-    if (!OPENAI_KEY) {
-      return res.status(500).json({
-        success: false,
-        error: "OPENAI_API_KEY is missing on the server",
-      });
-    }
+    const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 
     console.log(
-      `🎨 generate-preview | useCamera:${!!useCamera} | hasWheelImg:${!!wheelImageUrl} | hasCarImg:${!!carImageBase64}`
+      `🎨 generate-preview | useCamera:${!!useCamera} | hasWheelImg:${!!wheelImageUrl} | hasCarImg:${!!carImageBase64} | runpod:${!!RUNPOD_API_KEY}`
     );
 
     const detailedWheelDesc = await analyzeWheelImage({
@@ -727,33 +827,54 @@ app.post("/generate-preview", async (req, res) => {
     });
 
     let result;
+    let provider = "unknown";
+    let runpodError = null;
 
     if (useCamera && carImageBase64) {
-      result = await generateCameraPreview({
-        openaiKey: OPENAI_KEY,
-        carImageBase64,
-        wheelImageUrl,
-        detailedWheelDesc,
-        carModel,
-        carAngle,
-      });
+      try {
+        result = await runpodFluxKontextEdit({
+          runpodApiKey: RUNPOD_API_KEY,
+          carImageBase64,
+          detailedWheelDesc,
+          carModel,
+          carAngle,
+        });
+
+        provider = "runpod";
+      } catch (e) {
+        runpodError = e.message;
+        console.log("⚠️ RunPod failed, using OpenAI fallback:", e.message);
+
+        result = await openAICameraEditFallback({
+          openaiKey: OPENAI_KEY,
+          carImageBase64,
+          wheelImageUrl,
+          detailedWheelDesc,
+          carModel,
+          carAngle,
+        });
+
+        provider = "openai_fallback";
+      }
     } else {
-      result = await generateCarFromSpecsWithWheel({
+      result = await openAIGenerateCarFromSpecsFallback({
         openaiKey: OPENAI_KEY,
         wheelImageUrl,
         detailedWheelDesc,
         carModel,
         carAngle,
       });
+
+      provider = "openai_spec_fallback";
     }
 
     res.json({
       success: true,
       imageUrl: result.imageUrl,
       meta: {
-        provider: "openai",
+        provider,
         mode: result.providerMode,
-        usedWheelReference: result.usedWheelReference,
+        runpodError,
         hasWheelImage: !!wheelImageUrl,
         hasCarImage: !!carImageBase64,
         carModel: carModel || null,
