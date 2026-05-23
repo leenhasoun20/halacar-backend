@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
+import sharp from "sharp";
 
 dotenv.config();
 
@@ -416,6 +417,217 @@ function normalizeBase64Image(base64Image) {
   return base64Image.replace(/^data:image\/\w+;base64,/, "");
 }
 
+function distancePixels(a, b, width, height) {
+  const ax = a.x * width;
+  const ay = a.y * height;
+  const bx = b.x * width;
+  const by = b.y * height;
+
+  return Math.sqrt((ax - bx) ** 2 + (ay - by) ** 2);
+}
+
+function makeWheelMaskSvg(size) {
+  const r = size / 2;
+  return Buffer.from(`
+    <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="${r}" cy="${r}" r="${r * 0.495}" fill="white"/>
+    </svg>
+  `);
+}
+
+function makeShadowSvg(size) {
+  const r = size / 2;
+  return Buffer.from(`
+    <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <filter id="blur">
+          <feGaussianBlur stdDeviation="${Math.max(2, size * 0.025)}"/>
+        </filter>
+      </defs>
+      <ellipse
+        cx="${r}"
+        cy="${r * 1.03}"
+        rx="${r * 0.47}"
+        ry="${r * 0.45}"
+        fill="rgba(0,0,0,0.33)"
+        filter="url(#blur)"
+      />
+    </svg>
+  `);
+}
+
+async function removeSimpleBackgroundAndCircleWheel(wheelBuffer, size) {
+  const raw = await sharp(wheelBuffer)
+    .rotate()
+    .resize(size, size, {
+      fit: "cover",
+      position: "center",
+    })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const data = raw.data;
+  const channels = raw.info.channels;
+
+  for (let i = 0; i < data.length; i += channels) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const aIndex = i + 3;
+
+    const isWhiteBg = r > 232 && g > 232 && b > 232;
+    const isAlmostWhite = r > 245 && g > 245 && b > 245;
+    const isVeryLightGray = r > 225 && g > 225 && b > 225 && Math.abs(r - g) < 8 && Math.abs(g - b) < 8;
+
+    if (isWhiteBg || isAlmostWhite || isVeryLightGray) {
+      data[aIndex] = 0;
+    }
+  }
+
+  const cleaned = await sharp(data, {
+    raw: {
+      width: raw.info.width,
+      height: raw.info.height,
+      channels,
+    },
+  })
+    .png()
+    .toBuffer();
+
+  const mask = makeWheelMaskSvg(size);
+
+  return sharp(cleaned)
+    .composite([
+      {
+        input: mask,
+        blend: "dest-in",
+      },
+    ])
+    .png()
+    .toBuffer();
+}
+
+function buildWheelTargets(wheelFit, imageWidth, imageHeight) {
+  const targets = [];
+
+  if (wheelFit?.front?.center && wheelFit?.front?.edge) {
+    const radius = distancePixels(
+      wheelFit.front.center,
+      wheelFit.front.edge,
+      imageWidth,
+      imageHeight
+    );
+
+    targets.push({
+      name: "front",
+      cx: wheelFit.front.center.x * imageWidth,
+      cy: wheelFit.front.center.y * imageHeight,
+      radius,
+    });
+  }
+
+  if (wheelFit?.rear?.center && wheelFit?.rear?.edge) {
+    const radius = distancePixels(
+      wheelFit.rear.center,
+      wheelFit.rear.edge,
+      imageWidth,
+      imageHeight
+    );
+
+    targets.push({
+      name: "rear",
+      cx: wheelFit.rear.center.x * imageWidth,
+      cy: wheelFit.rear.center.y * imageHeight,
+      radius,
+    });
+  }
+
+  return targets.filter((t) => t.radius > 8);
+}
+
+async function generateGeometricWheelPreview({
+  carImageBase64,
+  wheelImageUrl,
+  wheelFit,
+}) {
+  if (!carImageBase64) {
+    throw new Error("carImageBase64 is required");
+  }
+
+  if (!wheelImageUrl) {
+    throw new Error("wheelImageUrl is required for geometric wheel fitting");
+  }
+
+  if (!wheelFit?.front || !wheelFit?.rear) {
+    throw new Error("wheelFit points are required");
+  }
+
+  const carBuffer = Buffer.from(normalizeBase64Image(carImageBase64), "base64");
+  const wheelBuffer = await urlToBuffer(wheelImageUrl);
+
+  const preparedCarBuffer = await sharp(carBuffer)
+    .rotate()
+    .resize({
+      width: 1600,
+      height: 1200,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .png()
+    .toBuffer();
+
+  const carMeta = await sharp(preparedCarBuffer).metadata();
+  const imageWidth = carMeta.width;
+  const imageHeight = carMeta.height;
+
+  const targets = buildWheelTargets(wheelFit, imageWidth, imageHeight);
+
+  if (targets.length === 0) {
+    throw new Error("No valid wheel targets found");
+  }
+
+  const composites = [];
+
+  for (const target of targets) {
+    const rimRadius = Math.max(10, Math.round(target.radius * 0.92));
+    const size = Math.max(24, rimRadius * 2);
+
+    const wheelPng = await removeSimpleBackgroundAndCircleWheel(wheelBuffer, size);
+    const shadow = makeShadowSvg(size);
+
+    const left = Math.round(target.cx - size / 2);
+    const top = Math.round(target.cy - size / 2);
+
+    composites.push({
+      input: shadow,
+      left,
+      top,
+      blend: "over",
+    });
+
+    composites.push({
+      input: wheelPng,
+      left,
+      top,
+      blend: "over",
+    });
+  }
+
+  const outputBuffer = await sharp(preparedCarBuffer)
+    .composite(composites)
+    .jpeg({
+      quality: 94,
+      mozjpeg: true,
+    })
+    .toBuffer();
+
+  return {
+    imageUrl: `data:image/jpeg;base64,${outputBuffer.toString("base64")}`,
+    providerMode: "geometric_wheel_fit",
+  };
+}
+
 async function analyzeWheelImage({ wheelImageUrl, wheelDescription, openaiKey }) {
   let detailedWheelDesc = wheelDescription || "modern premium alloy wheel rim";
 
@@ -475,191 +687,6 @@ Output ONLY the description, max 90 words.`,
   }
 
   return detailedWheelDesc;
-}
-
-function extractRunPodImageUrl(data) {
-  if (!data) return null;
-
-  if (typeof data === "string") return data;
-
-  if (data.image) return data.image;
-  if (data.image_url) return data.image_url;
-  if (data.imageUrl) return data.imageUrl;
-  if (data.url) return data.url;
-  if (data.result) return data.result;
-
-  if (data.output) {
-    if (typeof data.output === "string") return data.output;
-
-    if (data.output.result) return data.output.result;
-    if (data.output.image) return data.output.image;
-    if (data.output.image_url) return data.output.image_url;
-    if (data.output.imageUrl) return data.output.imageUrl;
-    if (data.output.url) return data.output.url;
-
-    if (Array.isArray(data.output)) {
-      const first = data.output[0];
-
-      if (typeof first === "string") return first;
-      if (first?.result) return first.result;
-      if (first?.image) return first.image;
-      if (first?.image_url) return first.image_url;
-      if (first?.imageUrl) return first.imageUrl;
-      if (first?.url) return first.url;
-    }
-
-    if (data.output.images && Array.isArray(data.output.images)) {
-      const first = data.output.images[0];
-
-      if (typeof first === "string") return first;
-      if (first?.result) return first.result;
-      if (first?.url) return first.url;
-      if (first?.image_url) return first.image_url;
-      if (first?.imageUrl) return first.imageUrl;
-    }
-  }
-
-  return null;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollRunPodJob({ runpodApiKey, jobId, maxAttempts = 60 }) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const statusRes = await fetch(
-      `https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/status/${jobId}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${runpodApiKey}`,
-        },
-      }
-    );
-
-    const statusData = await statusRes.json();
-
-    console.log(`🔁 RunPod poll ${attempt}/${maxAttempts}:`, statusData.status);
-
-    if (statusData.status === "COMPLETED") {
-      const imageUrl = extractRunPodImageUrl(statusData);
-
-      if (!imageUrl) {
-        throw new Error(
-          `RunPod completed but returned no image URL: ${JSON.stringify(statusData).slice(0, 800)}`
-        );
-      }
-
-      return {
-        imageUrl,
-        providerMode: "runpod_flux_kontext_public_endpoint",
-        raw: statusData,
-      };
-    }
-
-    if (statusData.status === "FAILED") {
-      throw new Error(
-        `RunPod job failed: ${JSON.stringify(statusData).slice(0, 800)}`
-      );
-    }
-
-    if (
-      statusData.status === "IN_QUEUE" ||
-      statusData.status === "IN_PROGRESS"
-    ) {
-      await sleep(3000);
-      continue;
-    }
-
-    await sleep(3000);
-  }
-
-  throw new Error("RunPod timeout: image generation took too long");
-}
-
-async function runpodFluxKontextEdit({
-  runpodApiKey,
-  carImageBase64,
-  detailedWheelDesc,
-  carModel,
-  carAngle,
-}) {
-  if (!runpodApiKey) {
-    throw new Error("RUNPOD_API_KEY is missing");
-  }
-
-  if (!carImageBase64) {
-    throw new Error("carImageBase64 is required for RunPod Flux Kontext");
-  }
-
-  const inputImage = carImageBase64.startsWith("data:image")
-    ? carImageBase64
-    : `data:image/jpeg;base64,${normalizeBase64Image(carImageBase64)}`;
-
-  const prompt =
-    `Replace the visible wheels on this car with ${detailedWheelDesc}. ` +
-    `Keep the car body, angle, lighting, background, windows, paint color, reflections, tires, and camera perspective the same. ` +
-    `Only change the metal alloy rim/spoke/center-cap area. ` +
-    `Make the wheel fitment realistic and accurate to the car perspective, with correct size, alignment, depth, and shadow. ` +
-    `The wheels must look naturally mounted on the car, photorealistic, sharp, and high quality. ` +
-    `Do not redraw the full car. Do not change the background. Do not change the tire rubber. ` +
-    `Car context: ${carModel || "unknown car"}, angle: ${carAngle || "unknown angle"}.`;
-
-  const response = await fetch(
-    "https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${runpodApiKey}`,
-      },
-      body: JSON.stringify({
-        input: {
-          prompt,
-          negative_prompt: "",
-          seed: -1,
-          num_inference_steps: 28,
-          guidance: 2,
-          image: inputImage,
-          size: "1024*1024",
-          output_format: "png",
-          enable_safety_checker: true,
-        },
-      }),
-    }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error ||
-        data?.message ||
-        `RunPod request failed: ${response.status}`
-    );
-  }
-
-  const directImageUrl = extractRunPodImageUrl(data);
-
-  if (directImageUrl) {
-    return {
-      imageUrl: directImageUrl,
-      providerMode: "runpod_flux_kontext_public_endpoint_direct",
-      raw: data,
-    };
-  }
-
-  if (data.id) {
-    return pollRunPodJob({
-      runpodApiKey,
-      jobId: data.id,
-    });
-  }
-
-  throw new Error(
-    `RunPod returned no image URL and no job id: ${JSON.stringify(data).slice(0, 800)}`
-  );
 }
 
 async function openAIGenerateCarFromSpecsFallback({
@@ -775,14 +802,34 @@ app.post("/generate-preview", async (req, res) => {
       wheelImageUrl,
       carImageBase64,
       useCamera,
+      wheelFit,
     } = req.body;
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-    const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 
     console.log(
-      `🎨 generate-preview | useCamera:${!!useCamera} | hasWheelImg:${!!wheelImageUrl} | hasCarImg:${!!carImageBase64} | runpod:${!!RUNPOD_API_KEY}`
+      `🎨 generate-preview | useCamera:${!!useCamera} | hasWheelImg:${!!wheelImageUrl} | hasCarImg:${!!carImageBase64} | hasWheelFit:${!!wheelFit}`
     );
+
+    if (useCamera && carImageBase64) {
+      const result = await generateGeometricWheelPreview({
+        carImageBase64,
+        wheelImageUrl,
+        wheelFit,
+      });
+
+      return res.json({
+        success: true,
+        imageUrl: result.imageUrl,
+        meta: {
+          provider: "geometric",
+          mode: result.providerMode,
+          hasWheelImage: !!wheelImageUrl,
+          hasCarImage: !!carImageBase64,
+          hasWheelFit: !!wheelFit,
+        },
+      });
+    }
 
     const detailedWheelDesc = await analyzeWheelImage({
       wheelImageUrl,
@@ -790,58 +837,20 @@ app.post("/generate-preview", async (req, res) => {
       openaiKey: OPENAI_KEY,
     });
 
-    let result;
-    let provider = "unknown";
-    let runpodError = null;
+    const result = await openAIGenerateCarFromSpecsFallback({
+      openaiKey: OPENAI_KEY,
+      wheelImageUrl,
+      detailedWheelDesc,
+      carModel,
+      carAngle,
+    });
 
-    if (useCamera && carImageBase64) {
-      try {
-        result = await runpodFluxKontextEdit({
-          runpodApiKey: RUNPOD_API_KEY,
-          carImageBase64,
-          detailedWheelDesc,
-          carModel,
-          carAngle,
-        });
-
-        provider = "runpod";
-      } catch (e) {
-        runpodError = e.message;
-        console.log("❌ RunPod failed, OpenAI fallback disabled:", e.message);
-
-        return res.status(500).json({
-          success: false,
-          error: "RunPod generation failed",
-          details: e.message,
-          meta: {
-            provider: "runpod_failed",
-            runpodError,
-            hasWheelImage: !!wheelImageUrl,
-            hasCarImage: !!carImageBase64,
-            carModel: carModel || null,
-            carAngle: carAngle || null,
-          },
-        });
-      }
-    } else {
-      result = await openAIGenerateCarFromSpecsFallback({
-        openaiKey: OPENAI_KEY,
-        wheelImageUrl,
-        detailedWheelDesc,
-        carModel,
-        carAngle,
-      });
-
-      provider = "openai_spec_fallback";
-    }
-
-    res.json({
+    return res.json({
       success: true,
       imageUrl: result.imageUrl,
       meta: {
-        provider,
+        provider: "openai_spec_fallback",
         mode: result.providerMode,
-        runpodError,
         hasWheelImage: !!wheelImageUrl,
         hasCarImage: !!carImageBase64,
         carModel: carModel || null,
