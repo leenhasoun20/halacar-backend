@@ -56,7 +56,7 @@ async function sendExpoPush(tokens, title, body, data = {}) {
 
   for (const chunk of chunks) {
     try {
-      const res = await fetch("https://exp.host/--/api/v2/push/send", {
+      const response = await fetch("https://exp.host/--/api/v2/push/send", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -65,7 +65,7 @@ async function sendExpoPush(tokens, title, body, data = {}) {
         body: JSON.stringify(chunk),
       });
 
-      const result = await res.json();
+      const result = await response.json();
       totalSent += chunk.length;
       console.log(`Push sent: ${chunk.length}`, result?.data?.slice(0, 2));
     } catch (e) {
@@ -295,8 +295,8 @@ app.post("/notify/ad", async (req, res) => {
 
     const tokens = [];
 
-    snapshot.forEach((doc) => {
-      const token = doc.data().expoPushToken;
+    snapshot.forEach((docSnap) => {
+      const token = docSnap.data().expoPushToken;
       if (token) tokens.push(token);
     });
 
@@ -401,13 +401,13 @@ app.post("/chat", async (req, res) => {
 });
 
 async function urlToBuffer(url) {
-  const r = await fetch(url);
+  const response = await fetch(url);
 
-  if (!r.ok) {
-    throw new Error(`Failed to download image: ${r.status} ${r.statusText}`);
+  if (!response.ok) {
+    throw new Error(`Failed to download image: ${response.status} ${response.statusText}`);
   }
 
-  const ab = await r.arrayBuffer();
+  const ab = await response.arrayBuffer();
   return Buffer.from(ab);
 }
 
@@ -493,11 +493,13 @@ function extractRunPodImageUrl(data) {
     if (typeof first === "string") return first;
     if (first?.image) return first.image;
     if (first?.image_url) return first.image_url;
+    if (first?.imageUrl) return first.imageUrl;
     if (first?.url) return first.url;
   }
 
   if (data.output?.image) return data.output.image;
   if (data.output?.image_url) return data.output.image_url;
+  if (data.output?.imageUrl) return data.output.imageUrl;
   if (data.output?.url) return data.output.url;
 
   if (data.output?.images && Array.isArray(data.output.images)) {
@@ -506,9 +508,104 @@ function extractRunPodImageUrl(data) {
     if (typeof first === "string") return first;
     if (first?.url) return first.url;
     if (first?.image_url) return first.image_url;
+    if (first?.imageUrl) return first.imageUrl;
   }
 
   return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollRunPodJob({ runpodApiKey, jobId, maxAttempts = 60 }) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const statusRes = await fetch(
+      `https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/status/${jobId}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${runpodApiKey}`,
+        },
+      }
+    );
+
+    const statusData = await statusRes.json();
+
+    console.log(`🔁 RunPod poll ${attempt}/${maxAttempts}:`, statusData.status);
+
+    if (statusData.status === "COMPLETED") {
+      const imageUrl = extractRunPodImageUrl(statusData);
+
+      if (!imageUrl) {
+        throw new Error(
+          `RunPod completed but returned no image URL: ${JSON.stringify(statusData).slice(0, 800)}`
+        );
+      }
+
+      return {
+        imageUrl,
+        providerMode: "runpod_flux_kontext_public_endpoint",
+        raw: statusData,
+      };
+    }
+
+    if (statusData.status === "FAILED") {
+      throw new Error(
+        `RunPod job failed: ${JSON.stringify(statusData).slice(0, 800)}`
+      );
+    }
+
+    if (
+      statusData.status === "IN_QUEUE" ||
+      statusData.status === "IN_PROGRESS"
+    ) {
+      await sleep(3000);
+      continue;
+    }
+
+    await sleep(3000);
+  }
+
+  throw new Error("RunPod timeout: image generation took too long");
+}
+
+async function uploadBase64ToRunPodAsset({ runpodApiKey, base64Image }) {
+  const cleanBase64 = normalizeBase64Image(base64Image);
+
+  const response = await fetch("https://api.runpod.ai/v2/upload", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${runpodApiKey}`,
+    },
+    body: JSON.stringify({
+      data: cleanBase64,
+      type: "image/png",
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error || data?.message || `RunPod upload failed: ${response.status}`
+    );
+  }
+
+  const uploadedUrl =
+    data.url ||
+    data.image ||
+    data.image_url ||
+    data.output?.url ||
+    data.output?.image ||
+    data.output?.image_url;
+
+  if (!uploadedUrl) {
+    throw new Error(`RunPod upload returned no URL: ${JSON.stringify(data).slice(0, 800)}`);
+  }
+
+  return uploadedUrl;
 }
 
 async function runpodFluxKontextEdit({
@@ -526,7 +623,7 @@ async function runpodFluxKontextEdit({
     throw new Error("carImageBase64 is required for RunPod Flux Kontext");
   }
 
-  const inputImage = carImageBase64.startsWith("data:image")
+  let inputImage = carImageBase64.startsWith("data:image")
     ? carImageBase64
     : `data:image/jpeg;base64,${normalizeBase64Image(carImageBase64)}`;
 
@@ -539,163 +636,80 @@ async function runpodFluxKontextEdit({
     `Do not redraw the full car. Do not change the background. Do not change the tire rubber. ` +
     `Car context: ${carModel || "unknown car"}, angle: ${carAngle || "unknown angle"}.`;
 
-  const response = await fetch("https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${runpodApiKey}`,
-    },
-    body: JSON.stringify({
-      input: {
-        prompt,
-        negative_prompt: "",
-        seed: -1,
-        num_inference_steps: 28,
-        guidance: 2,
-        image: inputImage,
-        size: "1024*1024",
-        output_format: "png",
-        enable_safety_checker: true,
-      },
-    }),
-  });
+  let data;
 
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(data?.error || data?.message || `RunPod request failed: ${response.status}`);
-  }
-
-  const imageUrl = extractRunPodImageUrl(data);
-
-  if (!imageUrl) {
-    throw new Error(`RunPod returned no image URL: ${JSON.stringify(data).slice(0, 500)}`);
-  }
-
-  return {
-    imageUrl,
-    providerMode: "runpod_flux_kontext_public_endpoint",
-    raw: data,
-  };
-}
-
-async function openAICameraEditFallback({
-  openaiKey,
-  carImageBase64,
-  wheelImageUrl,
-  detailedWheelDesc,
-  carModel,
-  carAngle,
-}) {
-  if (!openaiKey) {
-    throw new Error("OPENAI_API_KEY is missing and RunPod failed");
-  }
-
-  const base64Data = normalizeBase64Image(carImageBase64);
-  const carBuffer = Buffer.from(base64Data, "base64");
-
-  const prompt =
-    `Edit this real car photo professionally for an automotive wheel preview app. ` +
-    `Replace ONLY the visible metal alloy wheel rims with this wheel design: ${detailedWheelDesc}. ` +
-    `Keep the original rubber tires, tire size, car body, car color, windows, background, lighting, shadows, reflections, and camera perspective unchanged. ` +
-    `Do NOT redraw the full car. Do NOT change the car color. Do NOT change the background. ` +
-    `Do NOT change the tire rubber. Only the metal rim/spoke/center-cap area should change. ` +
-    `Fit the new rim perfectly inside the existing tire circles with correct perspective, realistic shadows, and natural lighting. ` +
-    `The final image must look like a real product preview photo, not a drawing. ` +
-    `Car context if useful: ${carModel || "unknown car"}, angle: ${carAngle || "side view"}.`;
-
-  if (wheelImageUrl) {
-    try {
-      const wheelBuffer = await urlToBuffer(wheelImageUrl);
-
-      const formData = new FormData();
-      formData.append("model", "gpt-image-1");
-      formData.append("prompt", prompt);
-      formData.append("size", "1536x1024");
-      formData.append("quality", "high");
-
-      formData.append(
-        "image",
-        new Blob([carBuffer], { type: "image/jpeg" }),
-        "car.jpg"
-      );
-
-      formData.append(
-        "image",
-        new Blob([wheelBuffer], { type: "image/jpeg" }),
-        "wheel.jpg"
-      );
-
-      const editRes = await fetch("https://api.openai.com/v1/images/edits", {
+  async function submitToRunPod(imageValue) {
+    const response = await fetch(
+      "https://api.runpod.ai/v2/black-forest-labs-flux-1-kontext-dev/run",
+      {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${openaiKey}`,
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${runpodApiKey}`,
         },
-        body: formData,
-      });
-
-      const editData = await editRes.json();
-
-      if (editData.data?.[0]?.url) {
-        return {
-          imageUrl: editData.data[0].url,
-          providerMode: "openai_camera_edit_with_wheel_reference",
-        };
+        body: JSON.stringify({
+          input: {
+            prompt,
+            negative_prompt: "",
+            seed: -1,
+            num_inference_steps: 28,
+            guidance: 2,
+            image: imageValue,
+            size: "1024*1024",
+            output_format: "png",
+            enable_safety_checker: true,
+          },
+        }),
       }
+    );
 
-      if (editData.data?.[0]?.b64_json) {
-        return {
-          imageUrl: `data:image/png;base64,${editData.data[0].b64_json}`,
-          providerMode: "openai_camera_edit_with_wheel_reference",
-        };
-      }
+    const responseData = await response.json();
 
-      console.log("⚠️ OpenAI two-image edit failed:", editData.error?.message || editData);
-    } catch (e) {
-      console.log("⚠️ OpenAI two-image camera edit exception:", e.message);
+    if (!response.ok) {
+      throw new Error(
+        responseData?.error ||
+          responseData?.message ||
+          `RunPod request failed: ${response.status}`
+      );
     }
+
+    return responseData;
   }
 
-  const fallbackFormData = new FormData();
-  fallbackFormData.append("model", "gpt-image-1");
-  fallbackFormData.append(
-    "prompt",
-    prompt +
-      ` The wheel reference image could not be directly attached, so follow the wheel description very carefully.`
-  );
-  fallbackFormData.append("size", "1536x1024");
-  fallbackFormData.append("quality", "high");
-  fallbackFormData.append(
-    "image",
-    new Blob([carBuffer], { type: "image/jpeg" }),
-    "car.jpg"
-  );
+  try {
+    data = await submitToRunPod(inputImage);
+  } catch (e) {
+    console.log("⚠️ RunPod base64 submit failed, trying uploaded image URL:", e.message);
 
-  const fallbackRes = await fetch("https://api.openai.com/v1/images/edits", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${openaiKey}`,
-    },
-    body: fallbackFormData,
-  });
+    const uploadedUrl = await uploadBase64ToRunPodAsset({
+      runpodApiKey,
+      base64Image: carImageBase64,
+    });
 
-  const fallbackData = await fallbackRes.json();
+    inputImage = uploadedUrl;
+    data = await submitToRunPod(inputImage);
+  }
 
-  if (fallbackData.data?.[0]?.url) {
+  const directImageUrl = extractRunPodImageUrl(data);
+
+  if (directImageUrl) {
     return {
-      imageUrl: fallbackData.data[0].url,
-      providerMode: "openai_camera_edit_description_only",
+      imageUrl: directImageUrl,
+      providerMode: "runpod_flux_kontext_public_endpoint_direct",
+      raw: data,
     };
   }
 
-  if (fallbackData.data?.[0]?.b64_json) {
-    return {
-      imageUrl: `data:image/png;base64,${fallbackData.data[0].b64_json}`,
-      providerMode: "openai_camera_edit_description_only",
-    };
+  if (data.id) {
+    return pollRunPodJob({
+      runpodApiKey,
+      jobId: data.id,
+    });
   }
 
-  throw new Error(fallbackData.error?.message || "OpenAI camera edit failed");
+  throw new Error(
+    `RunPod returned no image URL and no job id: ${JSON.stringify(data).slice(0, 800)}`
+  );
 }
 
 async function openAIGenerateCarFromSpecsFallback({
@@ -843,18 +857,21 @@ app.post("/generate-preview", async (req, res) => {
         provider = "runpod";
       } catch (e) {
         runpodError = e.message;
-        console.log("⚠️ RunPod failed, using OpenAI fallback:", e.message);
+        console.log("❌ RunPod failed, OpenAI fallback disabled:", e.message);
 
-        result = await openAICameraEditFallback({
-          openaiKey: OPENAI_KEY,
-          carImageBase64,
-          wheelImageUrl,
-          detailedWheelDesc,
-          carModel,
-          carAngle,
+        return res.status(500).json({
+          success: false,
+          error: "RunPod generation failed",
+          details: e.message,
+          meta: {
+            provider: "runpod_failed",
+            runpodError,
+            hasWheelImage: !!wheelImageUrl,
+            hasCarImage: !!carImageBase64,
+            carModel: carModel || null,
+            carAngle: carAngle || null,
+          },
         });
-
-        provider = "openai_fallback";
       }
     } else {
       result = await openAIGenerateCarFromSpecsFallback({
